@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from pathlib import Path
-import sqlite3
+import sqlite3, yaml
+import io as pyio
 
 class basics(object):
     _labutilspath = None
@@ -90,7 +91,10 @@ class io(basics):
         },
         'usecols':None,
         'skiprows':None,
-        'colnames':None
+        'colnames':None,
+        'db':{
+            'infocols':['project','sample', 'poreflids','thermocople_location_set','thermocople_locations_list']
+        }
     }
 
     @property
@@ -143,6 +147,95 @@ class io(basics):
             os.mkdir(outpath)
         return outpath
 
+    def _db_convert_buffer(self, buffer, round=True, decimals = 2, integer = False):
+        out = np.load(pyio.BytesIO(buffer))['v']
+        if round:
+            out = np.around(out, decimals = decimals)
+        if integer or (decimals == 0):
+            out = np.int64(out)
+        return out
+
+    def _db_fix_infovals(self, info):
+        h = info.replace('u','')
+        d = yaml.load(h, yaml.SafeLoader)
+        d = pd.Series(d)
+        return d
+    
+    def _db_get_identifier(self, s):
+        return '"' + s.replace('"', '""') + '"'
+
+    def _db_get_col_names(self, cursor, tablename):
+        """Get column names of a table, given its name and a cursor
+        (or connection) to the database.
+        """
+        reader=cursor.execute("SELECT * FROM {}".format(tablename))
+        return [x[0] for x in reader.description]
+    
+    def db_get_run_locs(self, run_info = None, run_id = None):
+        if run_info is None:
+            run_info = self.db_get_run_info(run_id = run_id)
+        locs = pd.DataFrame(run_info.iloc[:,-1][0], columns = ['port', 'depth'])
+        locs = locs.merge(self.tc_locations, on = 'port', sort = False).loc[:,['port','x','y','depth']]
+        locs.index = ['tc'+str(k).zfill(2) for k in range(1, 1+locs.shape[0])]
+        return locs
+
+    def db_get_run_info(self, drop_invalid = True, run_id = None):
+        infocols = self.settings['db']['infocols']
+        con = self.db_connect()
+        c = con.cursor()
+        # c.row_factory = sqlite3.Row
+        subset_msg = "SELECT id, infovals FROM database_run"
+        if run_id is not None:
+            subset_msg = subset_msg + " WHERE id="+str(int(run_id))
+        
+        c.execute(subset_msg)
+        data = c.fetchall()
+        df = pd.DataFrame(data, columns = ['id', 'infovals'])
+        # close connection to database
+        c.close()
+        con.close()
+        if drop_invalid:
+            df.dropna(inplace=True)
+            df.reset_index(inplace=True, drop = True)
+            df = pd.concat([df.loc[:,'id'], df.loc[:,'infovals'].apply(self._db_fix_infovals).loc[:,infocols]], axis = 1)
+            df.replace(to_replace='None', value=np.nan, inplace = True)
+            df.dropna(inplace=True, subset=['thermocople_locations_list'])
+            df.reset_index(inplace=True, drop = True)
+        return df
+    
+    def db_get_run_data(self, run_id, round_temp = True, decimals = 0, integer = True, reset_timer = True,
+                        append_xyz = True, remove_not_used = True):
+        """ return the run data based on a run_id"""
+        con = self.db_connect()
+        c = con.cursor()
+        subset_msg = "SELECT abbrev,data FROM database_trace WHERE capture_id="+str(int(run_id))
+        c.execute(subset_msg)
+        data = c.fetchall()
+        c.close()
+        con.close()
+        df = pd.DataFrame(data, columns = ['tc','data']).iloc[:-1,:]
+        trace = df.loc[:,'data'].apply(self._db_convert_buffer, round = round_temp, decimals = decimals, integer = integer).apply(pd.Series)
+        df = pd.concat([df.loc[:,'tc'], trace], axis=1)
+        df.set_index('tc', inplace = True)
+        df.index = [s.lower() for s in df.index.values]
+
+        if reset_timer:
+            df.loc['time',:] = df.loc['time',:] - df.loc['time',:].min()
+
+        if append_xyz:
+            locs = self.db_get_run_locs(run_id = run_id)
+            df = pd.merge(locs, df, left_index = True, right_index = True, how = 'right')
+            df.iloc[:,0] = df.iloc[:,0].fillna(0.5).apply(np.int64)
+            df.loc[df.index[:7].values,['x','y','depth']] = 0.5
+            df.loc[df.index[7],['x','y','depth']] = [0.5, 0.5, 1.0]
+            df.loc[df.index[8],['x','y','depth']] = [0.8, 0.8, 0.8]
+        
+        if remove_not_used:
+            out_index = df.index[df.iloc[:,4:].apply(np.max, axis=1)>0]
+            df = df.loc[out_index,:].copy()
+
+        return df
+
     def wrangler(self):
         pass
     
@@ -150,6 +243,7 @@ class io(basics):
         db_path = self.dbpath
         con = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
         return con
+    
 
     def __init__(self, labutilspath=None, basepath = './', datadir = 'exports', outdir = '_out', dbdir = 'db'):
         if labutilspath is None:
@@ -157,4 +251,28 @@ class io(basics):
             labutilspath = str(Path(currpath).parents[0])
         super().__init__(labutilspath=labutilspath)
         self._update_paths(basepath, datadir, outdir, dbdir)
+        return
+
+class postprocess(object):
+    
+    def get_tc_index(self, df):
+        tcindex = re.findall(r'tc[0-9]+',str(df.index.values))
+        return tcindex
+    
+    def data_mix_max_mean(self,df, round = True, decimals = 1):
+        tcindex = self.get_tc_index(df)
+        tccols  = df.columns.values[4:]
+        time = df.loc['time',tccols].values
+        tdata = np.array([time, df.loc[tcindex,tccols].min().values, 
+                         df.loc[tcindex,tccols].max().values, 
+                         df.loc[tcindex,tccols].mean().values,
+                         df.loc[tcindex,tccols].std().values])
+        dfout = pd.DataFrame(tdata.T, columns = ['t','min', 'max', 'mean', 'std'])
+        if round: 
+            dfout.iloc[:, 3:] = dfout.iloc[:, 3:].round(decimals)
+
+        return dfout
+
+    def __init__(self):
+        super().__init__()
         return
