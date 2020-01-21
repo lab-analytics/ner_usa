@@ -178,22 +178,38 @@ class io(basics):
         locs = locs.merge(self.tc_locations, on = 'port', sort = False).loc[:,['port','x','y','depth']]
         locs.index = ['tc'+str(k).zfill(2) for k in range(1, 1+locs.shape[0])]
         return locs
-
-    def db_get_run_info(self, drop_invalid = True, run_id = None):
-        infocols = self.settings['db']['infocols']
+    def _db_table_to_df(self, msg, columns = None):
         con = self.db_connect()
         c = con.cursor()
-        # c.row_factory = sqlite3.Row
-        subset_msg = "SELECT id, infovals FROM database_run"
-        if run_id is not None:
-            subset_msg = subset_msg + " WHERE id="+str(int(run_id))
-        
-        c.execute(subset_msg)
+        c.execute(msg)
         data = c.fetchall()
-        df = pd.DataFrame(data, columns = ['id', 'infovals'])
-        # close connection to database
         c.close()
         con.close()
+        df = pd.DataFrame(data, columns = columns)
+        return df
+    
+    def db_get_experiment_info(self, drop_invalid = True, run_id = None):
+
+        infocols = ['run_id', 'project', 'sample', 'pore_fluids', 'start', 'end', 'summary',
+                    'tc_locations_list']
+        
+        df1 = self.db_get_run_info(drop_invalid = drop_invalid, run_id = run_id)
+        df2 = self.db_get_capture_info(run_id = run_id)
+
+        df = pd.merge(df1, df2, left_on = 'id', right_on = 'run_id')
+        df = df.loc[:, infocols]
+        return df
+    
+    def db_get_run_info(self, drop_invalid = True, run_id = None):
+        infocols = ['project','sample', 'poreflids','thermocople_location_set','thermocople_locations_list']
+
+        msg = "SELECT id, infovals FROM database_run"
+        if run_id is not None:
+            msg = msg + " WHERE id="+str(int(run_id))
+        
+        df = self._db_table_to_df(msg, columns = ['id', 'infovals'])
+
+
         if drop_invalid:
             df.dropna(inplace=True)
             df.reset_index(inplace=True, drop = True)
@@ -201,20 +217,31 @@ class io(basics):
             df.replace(to_replace='None', value=np.nan, inplace = True)
             df.dropna(inplace=True, subset=['thermocople_locations_list'])
             df.reset_index(inplace=True, drop = True)
+        
+        df.columns = ['id', 'project','sample', 'pore_fluids','tc_locations_set','tc_locations_list']
+        return df
+    
+    def db_get_capture_info(self, run_id = None):
+        infocols = ['start', 'end', 'type', 'run_id', 'summary', 'comments']
+        
+        msg = "SELECT start, end, type, run_id, summary, comments FROM database_capture"
+        if run_id is not None:
+            msg = msg + " WHERE run_id="+str(int(run_id))
+        df = self._db_table_to_df(msg, columns = infocols)
         return df
     
     def db_get_run_data(self, run_id, round_temp = True, decimals = 0, integer = True, reset_timer = True,
                         append_xyz = True, remove_not_used = True):
         """ return the run data based on a run_id"""
-        con = self.db_connect()
-        c = con.cursor()
-        subset_msg = "SELECT abbrev,data FROM database_trace WHERE capture_id="+str(int(run_id))
-        c.execute(subset_msg)
-        data = c.fetchall()
-        c.close()
-        con.close()
-        df = pd.DataFrame(data, columns = ['tc','data']).iloc[:-1,:]
-        trace = df.loc[:,'data'].apply(self._db_convert_buffer, round = round_temp, decimals = decimals, integer = integer).apply(pd.Series)
+
+        msg = "SELECT abbrev,data FROM database_trace WHERE capture_id="+str(int(run_id))
+
+        df = self._db_table_to_df(msg, columns = ['tc', 'data'])
+        df = df.iloc[:-1,:]
+
+        trace = df.loc[:,'data'].apply(self._db_convert_buffer, 
+                                       round = round_temp, decimals = decimals, 
+                                       integer = integer).apply(pd.Series)
         df = pd.concat([df.loc[:,'tc'], trace], axis=1)
         df.set_index('tc', inplace = True)
         df.index = [s.lower() for s in df.index.values]
