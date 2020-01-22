@@ -5,6 +5,8 @@ from matplotlib import pyplot as plt
 from pathlib import Path
 import sqlite3, yaml
 import io as pyio
+import plotly.express as px
+import plotly.graph_objects as go
 
 class basics(object):
     _labutilspath = None
@@ -74,7 +76,7 @@ class basics(object):
         
         return
 
-class io(basics):
+class db_io(basics):
     
     settings = {
         'paths':{
@@ -96,6 +98,21 @@ class io(basics):
             'infocols':['project','sample', 'poreflids','thermocople_location_set','thermocople_locations_list']
         }
     }
+
+    probe_str = {
+        'rf':'low freq*|rf|radio|low',
+        'mw':'microwave|mw|micro',
+        'rh':'resistance|res|heater|rh',
+        'st':'steam|^st+( |:)'
+    }
+
+    exp_str = {
+        'baseline':'base|baseline',
+        'training':'initialization|training|train',
+        'installation':'install|installation'
+    }
+    
+    exp_info = None
 
     @property
     def datapath(self):
@@ -171,13 +188,19 @@ class io(basics):
         reader=cursor.execute("SELECT * FROM {}".format(tablename))
         return [x[0] for x in reader.description]
     
-    def db_get_run_locs(self, run_info = None, run_id = None):
-        if run_info is None:
-            run_info = self.db_get_run_info(run_id = run_id)
-        locs = pd.DataFrame(run_info.iloc[:,-1][0], columns = ['port', 'depth'])
+    def db_get_run_locs(self, run_id):
+        run_locs_raw = self.exp_info.loc[self.exp_info['capture_id']==run_id,'tc_locations_list'].values[0]
+        locs = pd.DataFrame(run_locs_raw, columns = ['port', 'depth'])
         locs = locs.merge(self.tc_locations, on = 'port', sort = False).loc[:,['port','x','y','depth']]
         locs.index = ['tc'+str(k).zfill(2) for k in range(1, 1+locs.shape[0])]
         return locs
+
+    def _dict_to_var(self, df, var, varout, dict_str):
+        for key in dict_str.keys():
+            ix = df[var].apply(lambda x: re.search(dict_str[key], x) is not None)
+            df.loc[ix,varout] = key
+        return
+
     def _db_table_to_df(self, msg, columns = None):
         con = self.db_connect()
         c = con.cursor()
@@ -187,17 +210,31 @@ class io(basics):
         con.close()
         df = pd.DataFrame(data, columns = columns)
         return df
-    
+
     def db_get_experiment_info(self, drop_invalid = True, run_id = None):
 
-        infocols = ['run_id', 'project', 'sample', 'pore_fluids', 'start', 'end', 'summary',
+        infocols = ['run_id', 'id_capture', 'project', 'sample', 'pore_fluids', 'start', 'end', 'summary',
                     'tc_locations_list']
         
         df1 = self.db_get_run_info(drop_invalid = drop_invalid, run_id = run_id)
         df2 = self.db_get_capture_info(run_id = run_id)
 
-        df = pd.merge(df1, df2, left_on = 'id', right_on = 'run_id')
+        df = pd.merge(df1, df2, left_on = 'id', right_on = 'run_id', suffixes=('_exp', '_capture'))
         df = df.loc[:, infocols]
+        df.columns = [infocols[0]] + ['capture_id'] + infocols[2:]
+        
+        df[['project', 'sample', 'summary']] = df[['project', 'sample', 'summary']].applymap(str.lower)
+
+        df['source'] = None
+        df['source_subtype'] = None
+        df['exp_type'] = 'test'
+
+        self._dict_to_var(df, 'project', 'source', self.probe_str)
+        self._dict_to_var(df, 'project', 'exp_type', self.exp_str)
+
+        df.loc[df['source'] == 'rh','source_subtype'] = df.loc[df['source'] == 'rh','project'].apply(lambda x: re.findall(r'60|30|90', x)[0])
+        df = df[['run_id','capture_id','source','source_subtype','exp_type','sample','start','end', 
+                 'tc_locations_list','summary','project']]
         return df
     
     def db_get_run_info(self, drop_invalid = True, run_id = None):
@@ -208,7 +245,6 @@ class io(basics):
             msg = msg + " WHERE id="+str(int(run_id))
         
         df = self._db_table_to_df(msg, columns = ['id', 'infovals'])
-
 
         if drop_invalid:
             df.dropna(inplace=True)
@@ -222,12 +258,13 @@ class io(basics):
         return df
     
     def db_get_capture_info(self, run_id = None):
-        infocols = ['start', 'end', 'type', 'run_id', 'summary', 'comments']
+        infocols = ['id', 'start', 'end', 'type', 'run_id', 'summary', 'comments']
         
-        msg = "SELECT start, end, type, run_id, summary, comments FROM database_capture"
+        msg = "SELECT id, start, end, type, run_id, summary, comments FROM database_capture"
         if run_id is not None:
             msg = msg + " WHERE run_id="+str(int(run_id))
         df = self._db_table_to_df(msg, columns = infocols)
+        df[['start','end']] = df[['start','end']].apply(pd.to_datetime, format = '%Y-%m-%d %H:%M:%S.%f')
         return df
     
     def db_get_run_data(self, run_id, round_temp = True, decimals = 0, integer = True, reset_timer = True,
@@ -272,21 +309,26 @@ class io(basics):
         return con
     
 
-    def __init__(self, labutilspath=None, basepath = './', datadir = 'exports', outdir = '_out', dbdir = 'db'):
+    def __init__(self, labutilspath=None, basepath = './', datadir = 'exports', outdir = '_out', dbdir = 'db', 
+                 vis_install = False):
         if labutilspath is None:
             currpath = os.path.dirname(__file__)
             labutilspath = str(Path(currpath).parents[0])
         super().__init__(labutilspath=labutilspath)
         self._update_paths(basepath, datadir, outdir, dbdir)
+
+        self.exp_info = self.db_get_experiment_info()
+        if not vis_install:
+            self.exp_info = self.exp_info.loc[self.exp_info['exp_type'] != 'installation',:]
         return
 
-class postprocess(object):
+class postprocess(db_io):
     
     def get_tc_index(self, df):
         tcindex = re.findall(r'tc[0-9]+',str(df.index.values))
         return tcindex
     
-    def data_mix_max_mean(self,df, round = True, decimals = 1):
+    def data_min_max_mean(self,df, round = True, decimals = 1):
         tcindex = self.get_tc_index(df)
         tccols  = df.columns.values[4:]
         time = df.loc['time',tccols].values
@@ -299,7 +341,47 @@ class postprocess(object):
             dfout.iloc[:, 3:] = dfout.iloc[:, 3:].round(decimals)
 
         return dfout
+    
+    def _get_ix_max(self,df2, var ='mean'):
+        ixmax = df2[var] == df2[var].max()
+        inmax = df2.loc[ixmax,:].index.values
+        if len(inmax)>1:
+            l = int(len(inmax)/2)
+        ix = inmax[l]
+        return ix
 
-    def __init__(self):
-        super().__init__()
+    def plot_min_max_mean(self, df2):
+        fig = px.scatter()
+        for var in ['min','max','mean']:
+            fig.add_scatter(x=df2.t, y=df2[var], text=df2.index, name = var, 
+            hovertemplate =
+                "<b>%{text}</b><br><br>"
+                '<b>Temp</b>:%{y} degC'+
+                '<br><b>time</b>: %{x} s<br>')
+        
+        ix = self._get_ix_max(df2)
+        xx = df2.loc[ix,'t']
+        yy = 1.15*df2.loc[ix,'max']
+        fig.add_shape(
+                      # Line Horizontal
+                      go.layout.Shape(
+                          type="line",
+                          x0=xx,
+                          y0=00,
+                          x1=xx,
+                          y1=yy,
+                          line=dict(
+                              color="LightBlue",
+                              width=4,
+                              dash="dashdot",
+                          ),
+                  ))
+        fig.update_layout(
+                          xaxis ={'title':'Time (s)'},
+                          yaxis ={'title':'Temperature (deg C)'})
+        return fig
+
+
+    def __init__(self, labutilspath=None, basepath='./', datadir='exports', outdir='_out', dbdir='db', vis_install=False):
+        super().__init__(labutilspath=labutilspath, basepath=basepath, datadir=datadir, outdir=outdir, dbdir=dbdir, vis_install=vis_install)
         return
