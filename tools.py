@@ -141,13 +141,14 @@ class io(object):
         return s.strftime(date_format)
 
     def df_to_xyzv(self, df, itercols = None, val_ix_ini = 4, xyz_val = ['x','y','depth'], ix_ini = 1,
-                   basename = 'file', outpath = './_out', header = False):
+                   basename = None, outpath = './_out', prepend = None, header = False):
         if itercols is None:
             itercols = df.columns[val_ix_ini:]
         self._mkdir(outpath)
         for col in itercols:
             cols = xyz_val + [col]
-            fname = basename + '_' + str(col).zfill(6)
+            fname = '_'.join(s for s in [prepend, str(col).zfill(6), basename] if s) 
+            #'_'.join()
             fpath = os.path.join(outpath, fname + '.csv')
             df.loc[df.index[ix_ini:],cols].to_csv(fpath, index = False, header = header)
         return
@@ -179,6 +180,11 @@ class db_io(basics, io):
         'installation':'install|installation'
     }
     
+    src_dict = {
+        'uhffwdpower':'rf',
+        'uhfamppower':'rf',
+        'mwfwdpower':'mw'
+    }
     exp_info = None
     
     def _list_to_regex(self, l):
@@ -274,8 +280,36 @@ class db_io(basics, io):
         df = df[['run_id','capture_id','source','source_subtype','exp_type','sample','start','end', 
                  'tc_locations_list','summary','project']]
         df.reset_index(inplace = True, drop = True)
+
         return df
-    
+    def db_exp_info_sanity(self):
+        for row in self.exp_info.iterrows():
+            db_ix  = row[0]
+            db_id  = row[1]['capture_id']
+            db_src = row[1]['source']
+
+
+            df = self.db_get_run_data(run_id=db_id, decimals=0, remove_not_used=False)
+            df = df.iloc[[1,4,6],4:].copy()
+            imx = df.max(axis=1).values
+            ixs = df.index[imx>0].values
+
+            em_src_test = re.findall('uhffwdpower|mwfwdpower', ' '.join(ixs))
+            if len(em_src_test)>0:
+                df_src = self.src_dict[em_src_test[0]]
+            else:
+                if db_src is not None:
+                    ph_src = re.findall('st|rh', db_src)
+                    if len(ph_src)>0:
+                        df_src = ph_src[0]
+                    else:
+                        df_src = 'rh'
+                else:
+                    df_src = 'rh'
+            if not df_src == db_src:
+                print(db_ix, db_id, db_src, df_src)
+                self.exp_info.loc[db_ix,'source'] = df_src
+
     def db_get_run_info(self, drop_invalid = True, run_id = None):
         infocols = ['project','sample', 'poreflids','thermocople_location_set','thermocople_locations_list']
 
@@ -350,7 +384,7 @@ class db_io(basics, io):
     
 
     def __init__(self, labutilspath=None, basepath = './', datadir = 'exports', outdir = '_out', dbdir = 'db', 
-                 vis_install = False):
+                 viewe_installed = False):
         if labutilspath is None:
             currpath = os.path.dirname(__file__)
             labutilspath = str(Path(currpath).parents[0])
@@ -361,28 +395,33 @@ class db_io(basics, io):
         self._update_paths(basepath, datadir, outdir, dbdir)
 
         self.exp_info = self.db_get_experiment_info()
-        if not vis_install:
+        if not viewe_installed:
             self.exp_info = self.exp_info.loc[self.exp_info['exp_type'] != 'installation',:]
             self.exp_info.reset_index(drop = True, inplace = True)
         return
 
 class postprocess(db_io):
 
+    _pp_settings = {
+        'outdir_vars':['basedir','subdir','capture_id'],
+        'baseoutdir_vars':['basedir','subdir']
+    }
+
     @property
     def experiments(self):
         return self.exp_info.loc[:,['capture_id','source','source_subtype','exp_type','sample','start','end']]
     
     @property
-    def _list_outdirs(self):
-        return self.exp_dbout[['basedir','subdir']].T.apply(lambda s: os.path.join(*s)).unique()
+    def _list_base_outdirs(self):
+        return self.exp_dbout[self.settings['baseoutdir_vars']].astype(np.str).T.apply(lambda s: os.path.join(*s)).unique()
 
     @property
     def list_outdirs(self):
-        return self.exp_dbout[['basedir','subdir']].T.apply(lambda s: os.path.join(*s))
+        return self.exp_dbout[self.settings['outdir_vars']].astype(np.str).T.apply(lambda s: os.path.join(*s))
 
     @property
     def list_fpaths_base(self):
-        return self.exp_dbout[['basedir', 'subdir', 'basename']].T.apply(lambda s: os.path.join(*s))
+        return self.exp_dbout[self.settings['outdir_vars'] + ['basename']].astype(np.str).T.apply(lambda s: os.path.join(*s))
 
     def get_tc_index(self, df):
         tcindex = re.findall(r'tc[0-9]+',str(df.index.values))
@@ -405,9 +444,11 @@ class postprocess(db_io):
     def _get_ix_max(self,df2, var ='mean'):
         ixmax = df2[var] == df2[var].max()
         inmax = df2.loc[ixmax,:].index.values
+        l = 0
         if len(inmax)>1:
             l = int(len(inmax)/2)
         ix = inmax[l]
+
         return ix
 
     def plot_min_max_mean(self, df2):
@@ -439,6 +480,32 @@ class postprocess(db_io):
         fig.update_layout(
                           xaxis ={'title':'Time (s)'},
                           yaxis ={'title':'Temperature (deg C)'})
+        fig.update_layout(
+                          shapes=[
+                              go.layout.Shape(
+                                  fillcolor="rgba(63, 81, 181, 0.2)",
+                                  line={"width": 0},
+                                  type="rect",
+                                  x0=00,
+                                  x1=xx,
+                                  xref="x",
+                                  y0=0,
+                                  y1=0.95,
+                                  yref="paper"
+                              ),
+                              go.layout.Shape(
+                                  fillcolor="rgba(76, 175, 80, 0.1)",
+                                  line={"width": 0},
+                                  type="rect",
+                                  x0=xx,
+                                  x1=df2.iloc[-1,0],
+                                  xref="x",
+                                  y0=0,
+                                  y1=0.95,
+                                  yref="paper"
+                              )
+                          ]
+        )
         return fig
 
     def _generate_exp_dbout(self):
@@ -453,7 +520,7 @@ class postprocess(db_io):
         return df
     
     def make_outdirs(self):
-        self._mkdir_outpath(subdirs = self._list_outdirs)
+        self._mkdir_outpath(subdirs = self._list_base_outdirs)
 
     def get_heating_cooling_cols(self, df, df2 = None, delta_t = 1800, delta_th = 0.5):
         if df2 is None:
@@ -473,28 +540,34 @@ class postprocess(db_io):
         df_cool = df.loc[df.index[1:],['x','y','depth'] + cool.tolist()]
         return df_heat, df_cool
 
-    def make_xyzval(self, run_id, decimals = 0):
+    def make_xyzval(self, run_id, decimals = 0, append_basename = True):
         df = self.db_get_run_data(run_id=run_id, decimals = decimals)
         ix = self.experiments.index[self.experiments['capture_id'] == run_id].values[0]
-        basename = self.exp_dbout.loc[ix,'basename']
+        basename = None
+        if append_basename:
+            basename = self.exp_dbout.loc[ix,'basename']
         basepath = os.path.join(self.outpath, self.list_outdirs[ix])
 
         heat, cool = self.get_heating_cooling_cols(df)
 
-        self.df_to_xyzv(df, itercols = heat, 
-                        basename = 'heat' + '_' + basename, 
+        self.df_to_xyzv(df, itercols = heat,
+                        prepend = 'heat',
+                        basename = basename, 
                         outpath = basepath)
         
-        self.df_to_xyzv(df, itercols = cool, 
-                        basename = 'cool' + '_' + basename, 
+        self.df_to_xyzv(df, itercols = cool,
+                        prepend = 'cool', 
+                        basename = basename, 
                         outpath = basepath)
         return
         #df_heat, df_cool = self.get_heating_cooling_df(df)
-
-
-
-
+    def exp_info_sanity_check(self):
+        self.db_exp_info_sanity()
+        self.__setattr__('exp_dbout', self._generate_exp_dbout())
+        return
+    
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.__setattr__('exp_dbout', self._generate_exp_dbout())
+        self.settings.update(self._pp_settings)
         return
