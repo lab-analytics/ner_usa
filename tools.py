@@ -76,8 +76,7 @@ class basics(object):
         
         return
 
-class db_io(basics):
-    
+class io(object):
     settings = {
         'paths':{
             'root':None,
@@ -90,30 +89,9 @@ class db_io(basics):
         'files':{
             'exclude':['.*','_*','*.asd','*.tcl', 'summary*','*map*', 'full*','combined*'],
             'include':['*.csv']
-        },
-        'usecols':None,
-        'skiprows':None,
-        'colnames':None,
-        'db':{
-            'infocols':['project','sample', 'poreflids','thermocople_location_set','thermocople_locations_list']
         }
     }
-
-    probe_str = {
-        'rf':'low freq*|rf|radio|low',
-        'mw':'microwave|mw|micro',
-        'rh':'resistance|res|heater|rh',
-        'st':'steam|^st+( |:)'
-    }
-
-    exp_str = {
-        'baseline':'base|baseline',
-        'training':'initialization|training|train',
-        'installation':'install|installation'
-    }
     
-    exp_info = None
-
     @property
     def datapath(self):
         return self._getpath('data')    
@@ -142,6 +120,55 @@ class db_io(basics):
         self.settings['paths']['out']  = os.path.join(basepath, outdir)
         self.settings['paths']['database']  = os.path.join(basepath, dbdir)
         return
+    
+    def _mkdir(self, path):
+        if not os.path.exists(path): os.makedirs(path)
+        return
+    
+    def _mkdir_outpath(self, outpath=None, subdirs=None):
+        if outpath is None:
+            outpath = self.outpath
+        
+        
+        self._mkdir(outpath)
+        if subdirs is not None:
+            for sdir in subdirs:
+                self._mkdir(os.path.join(outpath,sdir))
+        
+        return
+
+
+    def _fname_date(self, s, date_format = '%Y-%m-%d'):
+        return s.strftime(date_format)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+class db_io(basics, io):
+    
+    _db_settings = {
+        'usecols':None,
+        'skiprows':None,
+        'colnames':None,
+        'db':{
+            'infocols':['project','sample', 'poreflids','thermocople_location_set','thermocople_locations_list']
+        }
+    }
+
+    probe_str = {
+        'rf':'low freq*|rf|radio|low',
+        'mw':'microwave|mw|micro',
+        'rh':'resistance|res|heater|rh',
+        'st':'steam|^st+( |:)'
+    }
+
+    exp_str = {
+        'baseline':'base|baseline',
+        'training':'initialization|training|train',
+        'installation':'install|installation'
+    }
+    
+    exp_info = None
     
     def _list_to_regex(self, l):
         out = r'|'.join([fnmatch.translate(x) for x in l]) or r'$.'
@@ -235,6 +262,7 @@ class db_io(basics):
         df.loc[df['source'] == 'rh','source_subtype'] = df.loc[df['source'] == 'rh','project'].apply(lambda x: re.findall(r'60|30|90', x)[0])
         df = df[['run_id','capture_id','source','source_subtype','exp_type','sample','start','end', 
                  'tc_locations_list','summary','project']]
+        df.reset_index(inplace = True, drop = True)
         return df
     
     def db_get_run_info(self, drop_invalid = True, run_id = None):
@@ -314,16 +342,28 @@ class db_io(basics):
         if labutilspath is None:
             currpath = os.path.dirname(__file__)
             labutilspath = str(Path(currpath).parents[0])
+        
         super().__init__(labutilspath=labutilspath)
+
+        self.settings.update(self._db_settings)
         self._update_paths(basepath, datadir, outdir, dbdir)
 
         self.exp_info = self.db_get_experiment_info()
         if not vis_install:
             self.exp_info = self.exp_info.loc[self.exp_info['exp_type'] != 'installation',:]
+            self.exp_info.reset_index(drop = True, inplace = True)
         return
 
 class postprocess(db_io):
+
+    @property
+    def experiments(self):
+        return self.exp_info.loc[:,['capture_id','source','source_subtype','exp_type','sample','start','end']]
     
+    @property
+    def _list_outdirs(self):
+        return self.exp_dbout[['basedir','subdir']].T.apply(lambda s: os.path.join(*s)).unique()
+
     def get_tc_index(self, df):
         tcindex = re.findall(r'tc[0-9]+',str(df.index.values))
         return tcindex
@@ -381,7 +421,22 @@ class postprocess(db_io):
                           yaxis ={'title':'Temperature (deg C)'})
         return fig
 
+    def _generate_exp_dbout(self):
+        df = pd.DataFrame(columns=['capture_id','basedir','subdir','basename','processed'])
+        df[['capture_id','basedir']] = self.experiments[['capture_id','exp_type']].copy()
 
-    def __init__(self, labutilspath=None, basepath='./', datadir='exports', outdir='_out', dbdir='db', vis_install=False):
-        super().__init__(labutilspath=labutilspath, basepath=basepath, datadir=datadir, outdir=outdir, dbdir=dbdir, vis_install=vis_install)
+        df['subdir'] = self.experiments.loc[:,['source',
+                                            'source_subtype']].T.apply(lambda s: '_'.join(item for item in s if item)) 
+        df['basename'] =  self.experiments.loc[:,['start',
+                                                  'end']].applymap(self._fname_date).T.apply(lambda s: '_'.join(s))
+        
+        return df
+    
+    def make_outdirs(self):
+        self._mkdir_outpath(subdirs = self._list_outdirs)
+    
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.__setattr__('exp_dbout', self._generate_exp_dbout())
         return
