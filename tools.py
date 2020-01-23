@@ -137,9 +137,20 @@ class io(object):
         
         return
 
-
     def _fname_date(self, s, date_format = '%Y-%m-%d'):
         return s.strftime(date_format)
+
+    def df_to_xyzv(self, df, itercols = None, val_ix_ini = 4, xyz_val = ['x','y','depth'], ix_ini = 1,
+                   basename = 'file', outpath = './_out', header = False):
+        if itercols is None:
+            itercols = df.columns[val_ix_ini:]
+        self._mkdir(outpath)
+        for col in itercols:
+            cols = xyz_val + [col]
+            fname = basename + '_' + str(col).zfill(6)
+            fpath = os.path.join(outpath, fname + '.csv')
+            df.loc[df.index[ix_ini:],cols].to_csv(fpath, index = False, header = header)
+        return
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -321,6 +332,7 @@ class db_io(basics, io):
             df.loc[df.index[:7].values,['x','y','depth']] = 0.5
             df.loc[df.index[7],['x','y','depth']] = [0.5, 0.5, 1.0]
             df.loc[df.index[8],['x','y','depth']] = [0.8, 0.8, 0.8]
+            df[['x','y','depth']] = df[['x','y','depth']].apply(np.around, decimals = 4)
         
         if remove_not_used:
             out_index = df.index[df.iloc[:,4:].apply(np.max, axis=1)>0]
@@ -363,6 +375,14 @@ class postprocess(db_io):
     @property
     def _list_outdirs(self):
         return self.exp_dbout[['basedir','subdir']].T.apply(lambda s: os.path.join(*s)).unique()
+
+    @property
+    def list_outdirs(self):
+        return self.exp_dbout[['basedir','subdir']].T.apply(lambda s: os.path.join(*s))
+
+    @property
+    def list_fpaths_base(self):
+        return self.exp_dbout[['basedir', 'subdir', 'basename']].T.apply(lambda s: os.path.join(*s))
 
     def get_tc_index(self, df):
         tcindex = re.findall(r'tc[0-9]+',str(df.index.values))
@@ -434,8 +454,46 @@ class postprocess(db_io):
     
     def make_outdirs(self):
         self._mkdir_outpath(subdirs = self._list_outdirs)
+
+    def get_heating_cooling_cols(self, df, df2 = None, delta_t = 1800, delta_th = 0.5):
+        if df2 is None:
+            df2 = self.data_min_max_mean(df)
+        ix = self._get_ix_max(df2)
+        lframe = ix + 4
+        th = np.divmod(lframe,delta_t)
+        if th[1]>delta_th*delta_t:
+            lframe = lframe + delta_t - th[0]
+        cols_heat = np.append(df.columns.values[4:lframe:delta_t], df.columns[ix+4])
+        cols_cool = np.append(df.columns[ix+4],df.columns.values[lframe::delta_t])
+        return cols_heat, cols_cool
     
-    
+    def get_heating_cooling_df(self, df, df2 = None, delta_t = 1800, delta_th = 0.5):
+        heat, cool = self.get_heating_cooling_frames(df = df, df2 = df2, delta_t = delta_t, delta_th = delta_th)
+        df_heat = df.loc[df.index[1:],['x','y','depth'] + heat.tolist()]
+        df_cool = df.loc[df.index[1:],['x','y','depth'] + cool.tolist()]
+        return df_heat, df_cool
+
+    def make_xyzval(self, run_id, decimals = 0):
+        df = self.db_get_run_data(run_id=run_id, decimals = decimals)
+        ix = self.experiments.index[self.experiments['capture_id'] == run_id].values[0]
+        basename = self.exp_dbout.loc[ix,'basename']
+        basepath = os.path.join(self.outpath, self.list_outdirs[ix])
+
+        heat, cool = self.get_heating_cooling_cols(df)
+
+        self.df_to_xyzv(df, itercols = heat, 
+                        basename = 'heat' + '_' + basename, 
+                        outpath = basepath)
+        
+        self.df_to_xyzv(df, itercols = cool, 
+                        basename = 'cool' + '_' + basename, 
+                        outpath = basepath)
+        return
+        #df_heat, df_cool = self.get_heating_cooling_df(df)
+
+
+
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.__setattr__('exp_dbout', self._generate_exp_dbout())
