@@ -486,7 +486,7 @@ class postprocess(db_io):
                                   fillcolor="rgba(63, 81, 181, 0.2)",
                                   line={"width": 0},
                                   type="rect",
-                                  x0=00,
+                                  x0=0,
                                   x1=xx,
                                   xref="x",
                                   y0=0,
